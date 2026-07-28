@@ -1,0 +1,12 @@
+streamlit>=1.35
+pandas
+numpy
+plotly
+joblib
+scikit-learn
+xgboost
+streamlit-autorefresh
+openpyxl
+matplotlib
+seaborn
+reportlab
