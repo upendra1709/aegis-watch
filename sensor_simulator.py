@@ -4,9 +4,8 @@ sensor_simulator.py
 MODULE 1: Virtual IoT Sensor Simulator -- INTEGRATED with Aegis Watch
 
 Simulates live sensor data for the 10 existing Aegis Watch machines
-(M-01..M-10), each with a realistic, gradually-evolving fault profile
-(not random noise), matching the EXACT feature space the trained AEGIS
-XGBoost model expects:
+(M-01..M-10), matching the EXACT feature space the trained AEGIS XGBoost
+model expects:
 
     air_temp (K), process_temp (K), rpm, torque (Nm), tool_wear (min)
 
@@ -15,17 +14,51 @@ table utils/db_utils.py already uses -- so Home, My Machines, Machine
 Detail, Reports and Live Monitoring all light up with real, continuously
 changing data automatically, with no other changes needed on those pages.
 
-Machine fault profiles (assigned to the 10 seeded machines, in id order):
-    M-01  Healthy
-    M-02  Gradual overheating (temperature drifting up)
-    M-03  Rapid tool wear
-    M-04  Cooling degradation           -> Heat Dissipation risk
-    M-05  Motor overload                -> Power Failure risk (overloaded)
-    M-06  Under-load drift              -> Power Failure risk (under-loaded)
-    M-07  Healthy
-    M-08  Torque fluctuation            -> intermittent Overstrain risk
-    M-09  Severe tool wear              -> Tool Wear + Overstrain risk
-    M-10  Random fault after a short delay (good for a live demo)
+DESIGN: HEALTH-% FIRST, SENSORS DERIVED
+----------------------------------------------------------------------
+The rest of the app never stores a health score -- it always recomputes
+it live from the latest raw sensor reading via
+utils.model_utils.predict_machine_health() (the trained XGBoost model).
+That means the only way to *guarantee* a machine's displayed health-%
+lands in a specific band is to drive the simulator by the health target
+first, then work backwards to sensor values that the model itself will
+score at that target -- rather than hand-tuning temp/rpm/torque/wear
+drift and hoping it lands in the right place.
+
+So at startup, for each machine TYPE (L/M/H) we build a calibration
+table: 150,000 randomly sampled sensor combinations, scored through the
+REAL model in one batched call and sorted by health. That gives us an
+empirical health_score -> sensor-values lookup we can query instantly
+at every tick: "I want health X% right now" -> "here are real sensor
+values that make the model say X%". (A straight-line interpolation
+between a healthy and a bad baseline was tried first, but this model is
+nearly a step function -- health flips ~100% -> ~0% between two
+adjacent points on that line -- so random sampling across the whole
+space was needed to find real mid-range examples.) This is a one-time
+cost (~2 seconds total at startup, cached per type), not a per-tick cost.
+
+MACHINE BEHAVIOR (10 machines, in id order)
+----------------------------------------------------------------------
+    M-01  Healthy -- flat ~99% (near-constant, tiny wobble only)
+    M-02  Healthy -- randomly fluctuates 90-100%, never below 90
+    M-03  At-risk -- randomly fluctuates 60-80%
+    M-04  Healthy -- randomly fluctuates 90-100%, never below 90
+    M-05  Healthy -- randomly fluctuates 90-100%, never below 90
+    M-06  At-risk -- sawtooth 0-50%: climbs 0 -> 50, then falls back
+                     50 -> 0, repeats forever (never negative)
+    M-07  Healthy -- flat ~99% (near-constant, tiny wobble only)
+    M-08  Healthy -- randomly fluctuates 90-100%, never below 90
+    M-09  At-risk -- sawtooth 0-50%: climbs 0 -> 50, then falls back
+                     50 -> 0, repeats forever (never negative)
+    M-10  Healthy -- flat ~99% (near-constant, tiny wobble only)
+
+    -> 7 healthy machines total (3 flat-99, 4 fluctuating 90-100)
+    -> 3 at-risk machines total (1 fluctuating 60-80, 2 sawtoothing 0-50)
+
+Every target is hard-clamped to its band every tick, and the derived
+sensor values pass through the same hard safety-net bounds as before
+(temps 290-335K, RPM 800-3000, torque 1-90, wear 0.5-260), so this is
+safe to leave running indefinitely on a long-lived shared link.
 
 HOW TO RUN
 ----------
@@ -41,210 +74,238 @@ wired up in app.py:
 ----------------------------------------------------------------------
 """
 
-import math
 import random
 import time
 import threading
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
+
 from db_manager import get_connection, init_db
-from utils.db_utils import DEFAULT_READING_BY_TYPE
+from utils.model_utils import model as _ml_model, TYPE_MAPPING, FEATURE_COLS
 
 TICK_SECONDS = 3
+
+# Hard safety-net bounds -- applied to every derived reading, every tick,
+# no matter what the calibration table produced.
+BOUNDS = {
+    "air_temp": (290.0, 335.0),
+    "process_temp": (290.0, 335.0),
+    "rpm": (800.0, 3000.0),
+    "torque": (1.0, 90.0),
+    "tool_wear": (0.5, 260.0),
+}
 
 
 def _noise(scale):
     return random.gauss(0, scale)
 
 
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def _apply_bounds(values):
+    for key, (lo, hi) in BOUNDS.items():
+        values[key] = _clamp(values[key], lo, hi)
+    return values
+
+
 # ----------------------------------------------------------------------
-# Machine profiles
-# Each profile evolves its own internal tick counter so drift is gradual
-# and repeatable-looking, not jumping randomly between calls. Every
-# profile is seeded from the machine's ACTUAL latest reading in the DB
-# (falling back to a type-based baseline) so the simulator picks up
-# smoothly from wherever the seeded/demo data left off.
+# Calibration: health_score -> sensor-values lookup per machine TYPE
+# (L/M/H), built once (lazily, on first use).
+#
+# NOTE: the trained XGBoost classifier on this dataset turns out to be
+# extremely confident almost everywhere -- walking a straight line
+# between a "healthy" and a "bad" sensor baseline crosses the decision
+# boundary in a single step (health jumps ~100% -> ~0% between two
+# adjacent samples), so linear interpolation cannot produce reliable
+# mid-range values. Instead we randomly sample a large number of
+# plausible sensor combinations, score ALL of them through the real
+# model in one batched call (fast), and keep the whole table sorted by
+# health. Rare bands (e.g. 60-80%) are thinner but still have thousands
+# of real samples, which is what makes "wander randomly within 60-80%"
+# actually possible instead of chasing an unstable knife-edge.
 # ----------------------------------------------------------------------
 
-class MachineProfile:
-    """Default / healthy profile. Small noise + slow, normal tool wear only."""
+_CALIBRATION_SAMPLES = 150_000
+_calibration_cache = {}
 
-    def __init__(self, machine_id, start_values):
+
+def _score_batch(type_letter, air_temp, process_temp, rpm, torque, tool_wear):
+    type_code = TYPE_MAPPING[type_letter]
+    temp_diff = process_temp - air_temp
+    power_w = torque * rpm * (2 * np.pi / 60)
+    wear_torque = tool_wear * torque
+    heat_load = process_temp * torque
+    df = pd.DataFrame({
+        "Type": type_code,
+        "Air_temperature_K": air_temp,
+        "Process_temperature_K": process_temp,
+        "Rotational_speed_rpm": rpm,
+        "Torque_Nm": torque,
+        "Tool_wear_min": tool_wear,
+        "Temp_Difference": temp_diff,
+        "Power_W": power_w,
+        "Wear_Torque": wear_torque,
+        "Heat_Load": heat_load,
+    })[FEATURE_COLS]
+    failure_prob = _ml_model.predict_proba(df)[:, 1] * 100.0
+    return 100.0 - failure_prob
+
+
+def _build_calibration_table(type_letter, n=_CALIBRATION_SAMPLES, seed=None):
+    rng = np.random.default_rng(seed)
+    air_temp = rng.uniform(294.0, 304.0, n)
+    process_temp = air_temp + rng.uniform(0.0, 15.0, n)
+    rpm = rng.uniform(900.0, 2800.0, n)
+    torque = rng.uniform(15.0, 85.0, n)
+    tool_wear = rng.uniform(0.0, 250.0, n)
+
+    health = _score_batch(type_letter, air_temp, process_temp, rpm, torque, tool_wear)
+
+    order = np.argsort(health)
+    return {
+        "health": health[order],
+        "air_temp": air_temp[order],
+        "process_temp": process_temp[order],
+        "rpm": rpm[order],
+        "torque": torque[order],
+        "tool_wear": tool_wear[order],
+    }
+
+
+def _get_calibration(type_letter):
+    if type_letter not in _calibration_cache:
+        _calibration_cache[type_letter] = _build_calibration_table(type_letter)
+    return _calibration_cache[type_letter]
+
+
+def _sensor_values_for_health(type_letter, target_health):
+    table = _get_calibration(type_letter)
+    target_health = _clamp(target_health, 0.0, 100.0)
+
+    n = len(table["health"])
+    idx = int(np.searchsorted(table["health"], target_health))
+    # Jitter within a small neighbourhood of equally-good matches so the
+    # same target health doesn't always return byte-identical sensor
+    # values (keeps the live telemetry looking like real noisy sensors).
+    window = 25
+    lo = max(0, idx - window)
+    hi = min(n - 1, idx + window)
+    pick = random.randint(lo, hi)
+
+    values = {
+        "air_temp": float(table["air_temp"][pick]),
+        "process_temp": float(table["process_temp"][pick]),
+        "rpm": float(table["rpm"][pick]),
+        "torque": float(table["torque"][pick]),
+        "tool_wear": float(table["tool_wear"][pick]),
+    }
+    return _apply_bounds(values)
+
+
+# ----------------------------------------------------------------------
+# Health-target profiles. Each one only decides WHAT health-% the
+# machine should read this tick (mean-reverting / bouncing within its
+# band) -- the actual sensor numbers are derived via the calibration
+# table above so the app's own model scores them back to that target.
+# ----------------------------------------------------------------------
+
+class HealthTargetProfile:
+    def __init__(self, machine_id, type_letter, start_health):
         self.machine_id = machine_id
+        self.type_letter = type_letter
         self.tick = 0
-        self.values = dict(start_values)
+        self.target_health = start_health
+
+    def _next_target(self):
+        raise NotImplementedError
 
     def step(self):
         self.tick += 1
-        v = self.values
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + _noise(0.06)
-        v["rpm"] = v["rpm"] + _noise(4)
-        v["torque"] = v["torque"] + _noise(0.4)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
+        self.target_health = self._next_target()
+        return _sensor_values_for_health(self.type_letter, self.target_health)
 
 
-class GradualOverheating(MachineProfile):
-    """M-02 -- process temperature climbs faster than air temperature,
-    narrowing the temp differential the model uses for Heat Dissipation risk."""
+class FlatHealth99(HealthTargetProfile):
+    """Healthy machine that always reads ~99% -- tiny wobble only."""
 
-    def step(self):
-        self.tick += 1
-        v = self.values
-        drift = min(self.tick * 0.015, 4.5)
-        v["air_temp"] = v["air_temp"] + _noise(0.05) + drift * 0.2
-        v["process_temp"] = v["process_temp"] + _noise(0.06) + drift * 0.5
-        v["rpm"] = v["rpm"] + _noise(4)
-        v["torque"] = v["torque"] + _noise(0.4)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
+    LOW, HIGH = 98.5, 99.5
+
+    def __init__(self, machine_id, type_letter):
+        super().__init__(machine_id, type_letter, start_health=99.0)
+
+    def _next_target(self):
+        return _clamp(99.0 + _noise(0.15), self.LOW, self.HIGH)
 
 
-class RapidToolWear(MachineProfile):
-    """M-03 -- tool wear climbs steadily, dragging torque up with it
-    (approaching the Overstrain / Tool Wear thresholds)."""
+class Fluctuate90to100(HealthTargetProfile):
+    """Healthy machine that wanders randomly within 90-100%, mean-
+    reverting toward the center so it never gets stuck at an edge."""
 
-    def step(self):
-        self.tick += 1
-        v = self.values
-        v["tool_wear"] = min(v["tool_wear"] + 0.6, 245)
-        v["torque"] = v["torque"] + 0.03 + _noise(0.4)
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + _noise(0.06)
-        v["rpm"] = v["rpm"] + _noise(4)
-        return dict(v)
+    LOW, HIGH, CENTER = 90.0, 100.0, 95.0
 
+    def __init__(self, machine_id, type_letter):
+        super().__init__(machine_id, type_letter, start_health=random.uniform(90.0, 100.0))
 
-class CoolingDegradation(MachineProfile):
-    """M-04 -- classic Heat Dissipation Failure setup: the temp
-    differential shrinks below ~8.6K while rpm sags below ~1380."""
-
-    def step(self):
-        self.tick += 1
-        v = self.values
-        drift = min(self.tick * 0.02, 6.0)
-        v["air_temp"] = v["air_temp"] + drift * 0.4 + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + drift * 0.15 + _noise(0.06)
-        v["rpm"] = max(1150, v["rpm"] - self.tick * 1.2 + _noise(4))
-        v["torque"] = v["torque"] + _noise(0.4)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
+    def _next_target(self):
+        h = self.target_health + _noise(1.1) + (self.CENTER - self.target_health) * 0.04
+        return _clamp(h, self.LOW, self.HIGH)
 
 
-class MotorOverload(MachineProfile):
-    """M-05 -- torque and rpm both climb, pushing power draw
-    (torque * rpm) toward the Power Failure "overloaded" threshold."""
+class Fluctuate60to80(HealthTargetProfile):
+    """At-risk machine that wanders randomly within 60-80%, mean-
+    reverting toward the center so it never gets stuck at an edge."""
 
-    def step(self):
-        self.tick += 1
-        v = self.values
-        drift = min(self.tick * 0.08, 22)
-        v["torque"] = v["torque"] + drift * 0.3 + _noise(0.5)
-        v["rpm"] = v["rpm"] + self.tick * 1.5 + _noise(5)
-        v["air_temp"] = v["air_temp"] + drift * 0.05 + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + drift * 0.08 + _noise(0.06)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
+    LOW, HIGH, CENTER = 60.0, 80.0, 70.0
+
+    def __init__(self, machine_id, type_letter):
+        super().__init__(machine_id, type_letter, start_health=random.uniform(60.0, 80.0))
+
+    def _next_target(self):
+        h = self.target_health + _noise(1.1) + (self.CENTER - self.target_health) * 0.04
+        return _clamp(h, self.LOW, self.HIGH)
 
 
-class UnderloadDrift(MachineProfile):
-    """M-06 -- torque and rpm both sag, pushing power draw toward the
-    Power Failure "under-loaded" threshold."""
+class Sawtooth0to50(HealthTargetProfile):
+    """At-risk machine that climbs 0 -> 50 then falls back 50 -> 0,
+    repeating forever -- a genuine sawtooth/triangle wave, always
+    bouncing back up the moment it touches 0, never going negative."""
 
-    def step(self):
-        self.tick += 1
-        v = self.values
-        drift = min(self.tick * 0.05, 15)
-        v["torque"] = max(2.0, v["torque"] - drift * 0.4 + _noise(0.4))
-        v["rpm"] = max(900, v["rpm"] - self.tick * 1.0 + _noise(4))
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + _noise(0.06)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
+    LOW, HIGH = 0.0, 50.0
 
+    def __init__(self, machine_id, type_letter):
+        super().__init__(machine_id, type_letter, start_health=random.uniform(0.0, 50.0))
+        self.direction = random.choice([1, -1])
 
-class TorqueFluctuation(MachineProfile):
-    """M-08 -- torque oscillates with growing amplitude (seal/coupling
-    instability), intermittently spiking wear*torque past Overstrain."""
-
-    def step(self):
-        self.tick += 1
-        v = self.values
-        amplitude = min(self.tick * 0.1, 14)
-        v["torque"] = max(2.0, v["torque"] + amplitude * math.sin(self.tick / 4) * 0.3 + _noise(0.4))
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + _noise(0.06)
-        v["rpm"] = v["rpm"] + _noise(4)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-        return dict(v)
-
-
-class SevereToolWear(MachineProfile):
-    """M-09 -- fast-forward end-of-life cutting tool: wear ramps hard
-    into both the Tool Wear Risk band and the Overstrain threshold."""
-
-    def step(self):
-        self.tick += 1
-        v = self.values
-        v["tool_wear"] = min(v["tool_wear"] + 1.1, 250)
-        v["torque"] = v["torque"] + 0.05 + _noise(0.4)
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + v["tool_wear"] * 0.002 + _noise(0.06)
-        v["rpm"] = v["rpm"] + _noise(4)
-        return dict(v)
-
-
-class RandomFaultAfterDelay(MachineProfile):
-    """M-10 -- runs healthy, then after a short random delay develops a
-    randomly chosen fault. Good for demoing a LIVE state transition +
-    alert firing mid-presentation instead of waiting the whole time."""
-
-    FAULT_TYPES = ["overheat", "overload", "toolwear"]
-
-    def __init__(self, machine_id, start_values):
-        super().__init__(machine_id, start_values)
-        # fault appears roughly 60-150s after start (20-50 ticks @ 3s)
-        self.fault_start_tick = random.randint(20, 50)
-        self.fault_type = random.choice(self.FAULT_TYPES)
-
-    def step(self):
-        self.tick += 1
-        v = self.values
-        v["air_temp"] = v["air_temp"] + _noise(0.05)
-        v["process_temp"] = v["process_temp"] + _noise(0.06)
-        v["rpm"] = v["rpm"] + _noise(4)
-        v["torque"] = v["torque"] + _noise(0.4)
-        v["tool_wear"] = min(v["tool_wear"] + 0.03, 50)
-
-        if self.tick >= self.fault_start_tick:
-            elapsed = self.tick - self.fault_start_tick
-            drift = min(elapsed * 0.15, 20)
-            if self.fault_type == "overheat":
-                v["process_temp"] += drift * 0.6
-                v["rpm"] = max(1150, v["rpm"] - elapsed * 1.0)
-            elif self.fault_type == "overload":
-                v["torque"] += drift * 0.5
-                v["rpm"] += elapsed * 1.2
-            elif self.fault_type == "toolwear":
-                v["tool_wear"] = min(v["tool_wear"] + elapsed * 0.8, 250)
-                v["torque"] += drift * 0.1
-
-        return dict(v)
+    def _next_target(self):
+        step = 0.8 + abs(_noise(1.0))
+        h = self.target_health + self.direction * step
+        if h >= self.HIGH:
+            h = self.HIGH
+            self.direction = -1
+        elif h <= self.LOW:
+            h = self.LOW
+            self.direction = 1
+        return h
 
 
 # Profiles assigned to the 10 existing seeded machines, in id order.
+# 3x flat-99, 4x fluctuate-90-100 => 7 healthy machines.
+# 1x fluctuate-60-80, 2x sawtooth-0-50 => 3 at-risk machines.
 PROFILE_SEQUENCE = [
-    MachineProfile,          # M-01 Healthy
-    GradualOverheating,      # M-02
-    RapidToolWear,           # M-03
-    CoolingDegradation,      # M-04
-    MotorOverload,           # M-05
-    UnderloadDrift,          # M-06
-    MachineProfile,          # M-07 Healthy
-    TorqueFluctuation,       # M-08
-    SevereToolWear,          # M-09
-    RandomFaultAfterDelay,   # M-10
+    FlatHealth99,          # M-01
+    Fluctuate90to100,      # M-02
+    Fluctuate60to80,       # M-03
+    Fluctuate90to100,      # M-04
+    Fluctuate90to100,      # M-05
+    Sawtooth0to50,         # M-06
+    FlatHealth99,          # M-07
+    Fluctuate90to100,      # M-08
+    Sawtooth0to50,         # M-09
+    FlatHealth99,          # M-10
 ]
 
 
@@ -256,21 +317,6 @@ def _load_machine_ids_and_types():
     with get_connection() as conn:
         rows = conn.execute("SELECT id, machine_type FROM machines ORDER BY id").fetchall()
     return [(r["id"], r["machine_type"]) for r in rows]
-
-
-def _load_start_values(machine_id, machine_type):
-    """Seed each profile from the machine's actual latest reading (so the
-    simulator continues smoothly from the seeded/demo data) -- falling
-    back to the type-based baseline if the machine has no readings yet."""
-    with get_connection() as conn:
-        row = conn.execute(
-            """SELECT air_temp, process_temp, rpm, torque, tool_wear
-               FROM readings WHERE machine_id = ? ORDER BY reading_id DESC LIMIT 1""",
-            (machine_id,),
-        ).fetchone()
-    if row:
-        return dict(row)
-    return dict(DEFAULT_READING_BY_TYPE[machine_type])
 
 
 def _insert_reading(machine_id, values):
@@ -296,11 +342,16 @@ def run_simulator(stop_event: threading.Event = None):
     TICK_SECONDS. Pass a threading.Event to allow graceful stop."""
     init_db()
     machine_ids = _load_machine_ids_and_types()
+
+    # Pre-build the calibration table for every distinct machine type up
+    # front, so the first few ticks aren't slow.
+    for _, machine_type in machine_ids:
+        _get_calibration(machine_type)
+
     machines = {}
     for i, (machine_id, machine_type) in enumerate(machine_ids):
         profile_cls = PROFILE_SEQUENCE[i % len(PROFILE_SEQUENCE)]
-        start_values = _load_start_values(machine_id, machine_type)
-        machines[machine_id] = profile_cls(machine_id, start_values)
+        machines[machine_id] = profile_cls(machine_id, machine_type)
 
     print(f"[sensor_simulator] Simulating {len(machines)} machines every {TICK_SECONDS}s ...")
 
